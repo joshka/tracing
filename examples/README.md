@@ -31,8 +31,8 @@ This directory contains a collection of examples that demonstrate the use of the
     fields on spans and events.
   + `fmt-custom-event`: Demonstrates overriding how the [`fmt`] subscriber formats
     events.
-  + `fmt-multiple-writers`: demonstrates how [`fmt::Layer`] can write
-    to multiple destinations (in this instance, stdout and a file) simultaneously.
+  + `fmt-multiple-writers`: Demonstrates writing to multiple destinations and
+    conditionally enabling an optional destination with `--stdout`.
   + `fmt-source-locations`: demonstrates displaying source code locations
     with [`fmt::Layer`].
   + `subscriber-filter`: Demonstrates the `tracing-subscriber::filter` module,

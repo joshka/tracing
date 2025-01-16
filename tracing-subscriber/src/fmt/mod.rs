@@ -127,6 +127,31 @@
 //! also implement [`FormatEvent`] and [`FormatFields`]. See those traits'
 //! documentation for details on how to implement them.
 //!
+//! ## Output Destinations
+//!
+//! The [`Subscriber`] and [`Layer`] write formatted events using a
+//! [`MakeWriter`]. Since `MakeWriter` is implemented for [`Option<M>`], an
+//! output can be enabled or disabled without changing the composed writer's
+//! type. The [`MakeWriterExt`] combinators can route events to multiple
+//! outputs:
+//!
+//! ```rust
+//! use tracing_subscriber::fmt::writer::MakeWriterExt;
+//!
+//! # let enable_stdout = true;
+//! let stdout = enable_stdout.then_some(std::io::stdout);
+//! let writer = std::io::stderr.and(stdout);
+//!
+//! tracing_subscriber::fmt()
+//!     .with_writer(writer)
+//!     .init();
+//! ```
+//!
+//! See the [`writer`] module for level- and metadata-based routing as well as
+//! additional ways to combine writers. Writer combinators route the same
+//! formatted output to each destination. Compose multiple [`Layer`]s instead
+//! when each destination needs its own format or per-layer filter.
+//!
 //! ## Filters
 //!
 //! If you want to filter the `tracing` `Events` based on environment
@@ -189,6 +214,8 @@
 //!     https://docs.rs/tracing/latest/tracing/trait.Subscriber.html
 //! [`tracing`]: https://crates.io/crates/tracing
 //! [`fmt::format`]: mod@crate::fmt::format
+//! [`MakeWriterExt`]: writer::MakeWriterExt
+//! [`Option<M>`]: Option
 
 use alloc::boxed::Box;
 use core::any::TypeId;
@@ -1054,6 +1081,18 @@ impl<N, E, F, W> SubscriberBuilder<N, E, F, W> {
     ///     .with_writer(io::stderr)
     ///     .init();
     /// ```
+    ///
+    /// Using an [`Option`] to enable an output conditionally:
+    ///
+    /// ```rust
+    /// use tracing_subscriber::fmt;
+    ///
+    /// # let enable_stdout = true;
+    /// fmt()
+    ///     .with_writer(enable_stdout.then_some(std::io::stdout))
+    ///     .init();
+    /// ```
+    ///
     pub fn with_writer<W2>(self, make_writer: W2) -> SubscriberBuilder<N, E, F, W2>
     where
         W2: for<'writer> MakeWriter<'writer> + 'static,

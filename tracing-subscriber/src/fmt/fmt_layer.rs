@@ -179,6 +179,19 @@ impl<S, N, E, W> Layer<S, N, E, W> {
     /// # use tracing_subscriber::Layer as _;
     /// # let _ = layer.with_subscriber(tracing_subscriber::registry::Registry::default());
     /// ```
+    ///
+    /// Using an [`Option`] to enable an output conditionally:
+    ///
+    /// ```rust
+    /// use tracing_subscriber::fmt;
+    ///
+    /// # let enable_stdout = true;
+    /// let layer = fmt::layer()
+    ///     .with_writer(enable_stdout.then_some(std::io::stdout));
+    /// # use tracing_subscriber::Layer as _;
+    /// # let _ = layer.with_subscriber(tracing_subscriber::registry::Registry::default());
+    /// ```
+    ///
     pub fn with_writer<W2>(self, make_writer: W2) -> Layer<S, N, E, W2>
     where
         W2: for<'writer> MakeWriter<'writer> + 'static,

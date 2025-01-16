@@ -1,6 +1,22 @@
 //! Abstractions for creating [`io::Write`] instances.
 //!
+//! # Optional and Conditional Writers
+//!
+//! [`Option<M>`] enables or disables an entire output destination. When it is
+//! `Some`, it delegates to the inner [`MakeWriter`]; when it is `None`, it
+//! returns a writer that discards output. An optional destination can be added
+//! as the right-hand side of [`MakeWriterExt::and`], such as
+//! `required.and(optional)`. It can also fall back to another destination using
+//! [`MakeWriterExt::or_else`]. Since [`Option`] has inherent methods named
+//! `and` and `or_else`, invoking either `MakeWriterExt` combinator with an
+//! `Option` as the receiver requires explicit trait syntax.
+//!
+//! [`OptionalWriter<W>`] represents the related decision at the writer level.
+//! Filters return an `OptionalWriter` for each event, and `or_else` uses that
+//! value to decide whether to create its fallback writer.
+//!
 //! [`io::Write`]: std::io::Write
+//! [`Option<M>`]: Option
 
 use alloc::{boxed::Box, fmt, string::String, sync::Arc};
 use std::{
@@ -18,9 +34,9 @@ use tracing_core::Metadata;
 ///
 /// This trait is already implemented for function pointers and
 /// immutably-borrowing closures that return an instance of [`io::Write`], such
-/// as [`io::stdout`] and [`io::stderr`]. Additionally, it is implemented for
+/// as [`io::stdout`] and [`io::stderr`]. It is also implemented for
 /// [`std::sync::Mutex`] when the type inside the mutex implements
-/// [`io::Write`].
+/// [`io::Write`], and for [`Option<M>`] when `M` implements `MakeWriter`.
 ///
 /// # Examples
 ///
@@ -43,6 +59,38 @@ use tracing_core::Metadata;
 ///
 /// let subscriber = tracing_subscriber::fmt()
 ///     .with_writer(make_my_great_writer)
+///     .finish();
+/// # drop(subscriber);
+/// ```
+///
+/// An optional `MakeWriter` discards output when it is `None` and delegates to
+/// the wrapped `MakeWriter` when it is `Some`. This is useful for composing
+/// optional outputs with [`MakeWriterExt::and`]:
+///
+/// ```
+/// # let enable_stdout = true;
+/// use tracing_subscriber::fmt::writer::MakeWriterExt;
+///
+/// let stdout = enable_stdout.then_some(std::io::stdout);
+/// let stderr = std::io::stderr;
+///
+/// let subscriber = tracing_subscriber::fmt()
+///     .with_writer(stderr.and(stdout))
+///     .finish();
+/// # drop(subscriber);
+/// ```
+///
+/// An optional writer can also fall back to another destination:
+///
+/// ```
+/// # let enable_stdout = true;
+/// use tracing_subscriber::fmt::writer::MakeWriterExt;
+///
+/// let stdout = enable_stdout.then_some(std::io::stdout);
+/// let writer = MakeWriterExt::or_else(stdout, std::io::stderr);
+///
+/// let subscriber = tracing_subscriber::fmt()
+///     .with_writer(writer)
 ///     .finish();
 /// # drop(subscriber);
 /// ```
@@ -91,6 +139,7 @@ use tracing_core::Metadata;
 /// [`Event`]: tracing_core::event::Event
 /// [`io::stdout`]: std::io::stdout()
 /// [`io::stderr`]: std::io::stderr()
+/// [`Option<M>`]: Option
 /// [`MakeWriter::make_writer_for`]: MakeWriter::make_writer_for
 /// [`Metadata`]: tracing_core::Metadata
 /// [levels]: tracing_core::Level
@@ -414,6 +463,9 @@ pub trait MakeWriterExt<'a>: MakeWriter<'a> {
     /// the error is returned, so it is possible for one writer to fail while
     /// the other is written to successfully.
     ///
+    /// The `other` writer may be an [`Option<M>`], allowing that destination to
+    /// be enabled or disabled without changing the type of the combined writer.
+    ///
     /// # Examples
     ///
     /// ```
@@ -452,6 +504,7 @@ pub trait MakeWriterExt<'a>: MakeWriter<'a> {
     /// ```
     ///
     /// [writers]: std::io::Write
+    /// [`Option<M>`]: Option
     fn and<B>(self, other: B) -> Tee<Self, B>
     where
         Self: Sized,
@@ -570,7 +623,12 @@ pub enum EitherWriter<A, B> {
 /// conditionally enable or disable the returned writer based on a span or
 /// event's [`Metadata`].
 ///
+/// The [`MakeWriter`] implementation for [`Option<M>`] returns this type. A
+/// `Some` value produces an enabled `OptionalWriter<T>`, while `None` produces
+/// one that discards output.
+///
 /// [writer]: std::io::Write
+/// [`Option<M>`]: Option
 pub type OptionalWriter<T> = EitherWriter<T, std::io::Sink>;
 
 /// A [`MakeWriter`] combinator that only returns an enabled [writer] for spans
@@ -1147,6 +1205,41 @@ where
         match self.inner.make_writer_for(meta) {
             EitherWriter::A(writer) => EitherWriter::A(writer),
             EitherWriter::B(_) => EitherWriter::B(self.or_else.make_writer_for(meta)),
+        }
+    }
+}
+
+/// Makes an optional [`MakeWriter`] usable anywhere a `MakeWriter` is expected.
+///
+/// A `Some(make_writer)` delegates to the wrapped `MakeWriter`. A `None` value
+/// returns [`OptionalWriter::none`], which implements [`io::Write`] by
+/// discarding all output. When [`make_writer_for`][MakeWriter::make_writer_for]
+/// is called, a `Some` value forwards the event or span [`Metadata`] to the
+/// wrapped `MakeWriter` unchanged.
+///
+/// This allows optional destinations to be composed with the
+/// [`MakeWriterExt`] combinators. For example, `required.and(optional)` writes
+/// to `required` unconditionally and also writes to the optional destination
+/// when it is `Some`.
+impl<'a, M> MakeWriter<'a> for Option<M>
+where
+    M: MakeWriter<'a>,
+{
+    type Writer = OptionalWriter<M::Writer>;
+
+    #[inline]
+    fn make_writer(&'a self) -> Self::Writer {
+        match self {
+            Some(inner) => OptionalWriter::some(inner.make_writer()),
+            None => OptionalWriter::none(),
+        }
+    }
+
+    #[inline]
+    fn make_writer_for(&'a self, meta: &Metadata<'_>) -> Self::Writer {
+        match self {
+            Some(inner) => OptionalWriter::some(inner.make_writer_for(meta)),
+            None => OptionalWriter::none(),
         }
     }
 }
