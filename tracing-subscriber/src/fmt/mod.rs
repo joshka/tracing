@@ -196,6 +196,7 @@ use std::{error::Error, io};
 use tracing_core::{span, subscriber::Interest, Event, Metadata};
 
 mod fmt_layer;
+mod timing;
 #[cfg_attr(docsrs, doc(cfg(all(feature = "fmt", feature = "std"))))]
 pub mod format;
 #[cfg_attr(docsrs, doc(cfg(all(feature = "fmt", feature = "std"))))]

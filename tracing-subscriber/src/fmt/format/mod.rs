@@ -1773,31 +1773,13 @@ impl Default for FmtSpanConfig {
     }
 }
 
-pub(super) struct TimingDisplay(pub(super) u64);
-impl Display for TimingDisplay {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut t = self.0 as f64;
-        for unit in ["ns", "µs", "ms", "s"].iter() {
-            if t < 10.0 {
-                return write!(f, "{:.2}{}", t, unit);
-            } else if t < 100.0 {
-                return write!(f, "{:.1}{}", t, unit);
-            } else if t < 1000.0 {
-                return write!(f, "{:.0}{}", t, unit);
-            }
-            t /= 1000.0;
-        }
-        write!(f, "{:.0}s", t * 1000.0)
-    }
-}
-
 #[cfg(test)]
 pub(super) mod test {
     use crate::fmt::{test::MockMakeWriter, time::FormatTime};
     use alloc::{
         borrow::ToOwned,
         format,
-        string::{String, ToString},
+        string::String,
     };
     use tracing::{
         self,
@@ -2179,27 +2161,6 @@ pub(super) mod test {
 
             assert_info_hello_ignore_numeric(subscriber, make_writer, &expected)
         }
-    }
-
-    #[test]
-    fn format_nanos() {
-        fn fmt(t: u64) -> String {
-            TimingDisplay(t).to_string()
-        }
-
-        assert_eq!(fmt(1), "1.00ns");
-        assert_eq!(fmt(12), "12.0ns");
-        assert_eq!(fmt(123), "123ns");
-        assert_eq!(fmt(1234), "1.23µs");
-        assert_eq!(fmt(12345), "12.3µs");
-        assert_eq!(fmt(123456), "123µs");
-        assert_eq!(fmt(1234567), "1.23ms");
-        assert_eq!(fmt(12345678), "12.3ms");
-        assert_eq!(fmt(123456789), "123ms");
-        assert_eq!(fmt(1234567890), "1.23s");
-        assert_eq!(fmt(12345678901), "12.3s");
-        assert_eq!(fmt(123456789012), "123s");
-        assert_eq!(fmt(1234567890123), "1235s");
     }
 
     #[test]

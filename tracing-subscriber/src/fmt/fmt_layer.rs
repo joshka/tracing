@@ -6,13 +6,15 @@ use crate::{
 };
 use alloc::{fmt, format, string::String};
 use core::{any::TypeId, marker::PhantomData, ops::Deref};
-use format::{FmtSpan, TimingDisplay};
+use format::FmtSpan;
 use std::{cell::RefCell, env, eprintln, io, thread_local, time::Instant};
 use tracing_core::{
     field,
     span::{Attributes, Current, Id, Record},
     Event, Metadata, Subscriber,
 };
+
+use super::timing::{TimingDisplay, Timings};
 
 /// A [`Layer`] that logs formatted representations of `tracing` events.
 ///
@@ -897,7 +899,7 @@ where
             && self.fmt_span.trace_close()
             && extensions.get_mut::<Timings>().is_none()
         {
-            extensions.insert(Timings::new());
+            extensions.insert(Timings::new(Instant::now()));
         }
 
         if self.fmt_span.trace_new() {
@@ -930,16 +932,13 @@ where
     }
 
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
-        if self.fmt_span.trace_enter() || self.fmt_span.trace_close() && self.fmt_span.fmt_timing {
+        // Timing state outlives the layer configuration that created it, so
+        // reloads must keep forwarding lifecycle callbacks while any exists.
+        if self.fmt_span.trace_enter() || Timings::any_live() {
             let span = ctx.span(id).expect("Span not found, this is a bug");
             let mut extensions = span.extensions_mut();
             if let Some(timings) = extensions.get_mut::<Timings>() {
-                if timings.entered_count == 0 {
-                    let now = Instant::now();
-                    timings.idle += (now - timings.last).as_nanos() as u64;
-                    timings.last = now;
-                }
-                timings.entered_count += 1;
+                timings.enter(Instant::now);
             }
 
             if self.fmt_span.trace_enter() {
@@ -953,16 +952,13 @@ where
     }
 
     fn on_exit(&self, id: &Id, ctx: Context<'_, S>) {
-        if self.fmt_span.trace_exit() || self.fmt_span.trace_close() && self.fmt_span.fmt_timing {
+        // Keep timing state balanced independently of whether this exit is
+        // currently emitted as an event.
+        if self.fmt_span.trace_exit() || Timings::any_live() {
             let span = ctx.span(id).expect("Span not found, this is a bug");
             let mut extensions = span.extensions_mut();
             if let Some(timings) = extensions.get_mut::<Timings>() {
-                timings.entered_count -= 1;
-                if timings.entered_count == 0 {
-                    let now = Instant::now();
-                    timings.busy += (now - timings.last).as_nanos() as u64;
-                    timings.last = now;
-                }
+                timings.exit(Instant::now);
             }
 
             if self.fmt_span.trace_exit() {
@@ -979,18 +975,11 @@ where
         if self.fmt_span.trace_close() {
             let span = ctx.span(&id).expect("Span not found, this is a bug");
             let extensions = span.extensions();
-            if let Some(timing) = extensions.get::<Timings>() {
-                let Timings {
-                    busy,
-                    mut idle,
-                    last,
-                    entered_count,
-                } = *timing;
-                debug_assert_eq!(entered_count, 0);
-                idle += (Instant::now() - last).as_nanos() as u64;
-
-                let t_idle = field::display(TimingDisplay(idle));
-                let t_busy = field::display(TimingDisplay(busy));
+            if let Some(timings) = extensions.get::<Timings>() {
+                debug_assert!(timings.is_idle());
+                let timings = timings.snapshot(Instant::now());
+                let t_idle = field::display(TimingDisplay(timings.idle()));
+                let t_busy = field::display(TimingDisplay(timings.busy()));
 
                 with_event_from_span!(
                     id,
@@ -1271,24 +1260,6 @@ where
     /// [field formatter]: FormatFields
     pub fn field_format(&self) -> &N {
         self.fmt_fields
-    }
-}
-
-struct Timings {
-    idle: u64,
-    busy: u64,
-    last: Instant,
-    entered_count: u64,
-}
-
-impl Timings {
-    fn new() -> Self {
-        Self {
-            idle: 0,
-            busy: 0,
-            last: Instant::now(),
-            entered_count: 0,
-        }
     }
 }
 
@@ -1713,69 +1684,111 @@ mod test {
         );
     }
 
-    // Regression characterization for https://github.com/tokio-rs/tracing/issues/3529.
-    //
-    // This intentionally asserts the known-broken behavior. Disabling span
-    // events between an enter and its exit skips the exit's timing update, so
-    // closing the span after re-enabling events trips the balance assertion.
-    // The following fix changes this test to assert that the span closes with
-    // timing data instead.
+    // Regression test for https://github.com/tokio-rs/tracing/issues/3529.
+    // An exit must update existing timing state even when span events are
+    // disabled after the matching enter.
     #[test]
     fn span_timing_when_events_are_disabled_before_exit() {
+        let make_writer = MockMakeWriter::default();
         let layer = fmt::Layer::default()
-            .with_writer(io::sink)
+            .with_writer(make_writer.clone())
+            .with_level(false)
+            .with_ansi(false)
+            .with_timer(MockTime)
             .with_span_events(FmtSpan::CLOSE);
         let (layer, reload_handle) = crate::reload::Layer::new(layer);
         let subscriber = layer.with_subscriber(Registry::default());
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            with_default(subscriber, || {
-                let span = tracing::info_span!("span");
-                let entered = span.enter();
-                reload_handle
-                    .modify(|layer| layer.set_span_events(FmtSpan::NONE))
-                    .unwrap();
-                drop(entered);
-                reload_handle
-                    .modify(|layer| layer.set_span_events(FmtSpan::CLOSE))
-                    .unwrap();
-                drop(span);
-            });
-        }));
+        with_default(subscriber, || {
+            let span = tracing::info_span!("span");
+            let entered = span.enter();
+            reload_handle
+                .modify(|layer| layer.set_span_events(FmtSpan::NONE))
+                .unwrap();
+            drop(entered);
+            reload_handle
+                .modify(|layer| layer.set_span_events(FmtSpan::CLOSE))
+                .unwrap();
+            drop(span);
+        });
 
-        assert!(result.is_err(), "closing the span currently panics");
+        assert_eq!(
+            sanitize_timings(make_writer.get_string()),
+            "fake time span: tracing_subscriber::fmt::fmt_layer::test: close timing timing\n"
+        );
     }
 
-    // Regression characterization for the inverse of
-    // https://github.com/tokio-rs/tracing/issues/3529.
-    //
-    // This intentionally asserts the known-broken behavior. Entering while
-    // span events are disabled skips the timing update, so exiting after
-    // re-enabling events underflows the nesting count. The following fix
-    // changes this test to assert that the span closes with timing data.
+    // Regression test for the inverse of
+    // https://github.com/tokio-rs/tracing/issues/3529. An enter must update
+    // existing timing state even when span events are disabled before the
+    // matching exit.
     #[test]
     fn span_timing_when_events_are_disabled_before_enter() {
+        let make_writer = MockMakeWriter::default();
         let layer = fmt::Layer::default()
-            .with_writer(io::sink)
+            .with_writer(make_writer.clone())
+            .with_level(false)
+            .with_ansi(false)
+            .with_timer(MockTime)
             .with_span_events(FmtSpan::CLOSE);
         let (layer, reload_handle) = crate::reload::Layer::new(layer);
         let subscriber = layer.with_subscriber(Registry::default());
 
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            with_default(subscriber, || {
-                let span = tracing::info_span!("span");
-                reload_handle
-                    .modify(|layer| layer.set_span_events(FmtSpan::NONE))
-                    .unwrap();
-                let entered = span.enter();
-                reload_handle
-                    .modify(|layer| layer.set_span_events(FmtSpan::CLOSE))
-                    .unwrap();
-                drop(entered);
-                drop(span);
-            });
-        }));
+        with_default(subscriber, || {
+            let span = tracing::info_span!("span");
+            reload_handle
+                .modify(|layer| layer.set_span_events(FmtSpan::NONE))
+                .unwrap();
+            let entered = span.enter();
+            reload_handle
+                .modify(|layer| layer.set_span_events(FmtSpan::CLOSE))
+                .unwrap();
+            drop(entered);
+            drop(span);
+        });
 
-        assert!(result.is_err(), "exiting the span currently panics");
+        assert_eq!(
+            sanitize_timings(make_writer.get_string()),
+            "fake time span: tracing_subscriber::fmt::fmt_layer::test: close timing timing\n"
+        );
+    }
+
+    // Extends the regression coverage for
+    // https://github.com/tokio-rs/tracing/issues/3529 to replacing the whole
+    // formatter layer rather than modifying its span-event configuration.
+    #[test]
+    fn timed_span_remains_tracked_when_layer_is_replaced() {
+        let make_writer = MockMakeWriter::default();
+        let make_layer = |kind| {
+            fmt::Layer::default()
+                .with_writer(make_writer.clone())
+                .with_level(false)
+                .with_ansi(false)
+                .with_timer(MockTime)
+                .with_span_events(kind)
+        };
+        let (layer, reload_handle) = crate::reload::Layer::new(make_layer(FmtSpan::CLOSE));
+        let subscriber = layer.with_subscriber(Registry::default());
+
+        with_default(subscriber, || {
+            let span = tracing::info_span!("span");
+
+            reload_handle.reload(make_layer(FmtSpan::NONE)).unwrap();
+            let entered = span.enter();
+            reload_handle.reload(make_layer(FmtSpan::CLOSE)).unwrap();
+            drop(entered);
+
+            let entered = span.enter();
+            reload_handle.reload(make_layer(FmtSpan::NONE)).unwrap();
+            drop(entered);
+            reload_handle.reload(make_layer(FmtSpan::CLOSE)).unwrap();
+
+            drop(span);
+        });
+
+        assert_eq!(
+            sanitize_timings(make_writer.get_string()),
+            "fake time span: tracing_subscriber::fmt::fmt_layer::test: close timing timing\n"
+        );
     }
 }
