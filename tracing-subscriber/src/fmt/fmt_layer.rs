@@ -1712,4 +1712,70 @@ mod test {
             actual.as_str()
         );
     }
+
+    // Regression characterization for https://github.com/tokio-rs/tracing/issues/3529.
+    //
+    // This intentionally asserts the known-broken behavior. Disabling span
+    // events between an enter and its exit skips the exit's timing update, so
+    // closing the span after re-enabling events trips the balance assertion.
+    // The following fix changes this test to assert that the span closes with
+    // timing data instead.
+    #[test]
+    fn span_timing_when_events_are_disabled_before_exit() {
+        let layer = fmt::Layer::default()
+            .with_writer(io::sink)
+            .with_span_events(FmtSpan::CLOSE);
+        let (layer, reload_handle) = crate::reload::Layer::new(layer);
+        let subscriber = layer.with_subscriber(Registry::default());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_default(subscriber, || {
+                let span = tracing::info_span!("span");
+                let entered = span.enter();
+                reload_handle
+                    .modify(|layer| layer.set_span_events(FmtSpan::NONE))
+                    .unwrap();
+                drop(entered);
+                reload_handle
+                    .modify(|layer| layer.set_span_events(FmtSpan::CLOSE))
+                    .unwrap();
+                drop(span);
+            });
+        }));
+
+        assert!(result.is_err(), "closing the span currently panics");
+    }
+
+    // Regression characterization for the inverse of
+    // https://github.com/tokio-rs/tracing/issues/3529.
+    //
+    // This intentionally asserts the known-broken behavior. Entering while
+    // span events are disabled skips the timing update, so exiting after
+    // re-enabling events underflows the nesting count. The following fix
+    // changes this test to assert that the span closes with timing data.
+    #[test]
+    fn span_timing_when_events_are_disabled_before_enter() {
+        let layer = fmt::Layer::default()
+            .with_writer(io::sink)
+            .with_span_events(FmtSpan::CLOSE);
+        let (layer, reload_handle) = crate::reload::Layer::new(layer);
+        let subscriber = layer.with_subscriber(Registry::default());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_default(subscriber, || {
+                let span = tracing::info_span!("span");
+                reload_handle
+                    .modify(|layer| layer.set_span_events(FmtSpan::NONE))
+                    .unwrap();
+                let entered = span.enter();
+                reload_handle
+                    .modify(|layer| layer.set_span_events(FmtSpan::CLOSE))
+                    .unwrap();
+                drop(entered);
+                drop(span);
+            });
+        }));
+
+        assert!(result.is_err(), "exiting the span currently panics");
+    }
 }
